@@ -1,124 +1,178 @@
 package provisioner
 
-import "strconv"
+import (
+	"fmt"
 
-import "k8s.io/client-go/pkg/api/v1"
-import "github.com/prometheus/client_golang/prometheus"
-import zfs "github.com/simt2/go-zfs"
-import log "github.com/Sirupsen/logrus"
+	"github.com/kubernetes-incubator/external-storage/lib/controller"
+	"github.com/mitchellh/mapstructure"
 
-const (
-	annCreatedBy = "kubernetes.io/createdby"
-	createdBy    = "zfs-provisioner"
+	"github.com/Sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	zfs "github.com/simt2/go-zfs"
 )
 
-// ZFSProvisioner implements the Provisioner interface to create and export ZFS volumes
+const (
+	annCreatedBy   = "kubernetes.io/createdby"
+	annDatasetPath = "gentics.com/kubernetes-zfs-provisioner/datasetpath"
+	createdBy      = "zfs-provisioner"
+)
+
+// ZFSProvisionerParameters contains attributes related to ZFS, exporting of
+// created volumes and metrics. The "parameters" field in a storageClass
+// backed by this provisioner represents ZFSProvisionerParameters.
+type ZFSProvisionerParameters struct {
+	ParentDataset string        `mapstructure:"parentDataset"`
+	Prometheus    bool          `mapstructure:"prometheus"`
+	NFS           NFSParameters `mapstructure:"nfs"`
+}
+
+// NFSParameters contains attributes related to exporting volumes via NFS.
+type NFSParameters struct {
+	AdditonalShareOptions string `mapstructure:"additionalShareOptions"`
+	Enabled               bool   `mapstructure:"enabled"`
+	ServerHostname        string `mapstructure:"serverHostname"`
+	ShareSubnet           string `mapstructure:"shareSubnet"`
+}
+
+// ZFSProvisioner implements the Provisioner interface to create and export ZFS
+// volumes. It implements
+// github.com/kubernetes-incubator/external-storage/lib/controller.Provisioner
 type ZFSProvisioner struct {
-	parent *zfs.Dataset // The parent dataset
-
-	shareOptions   string // Additional nfs export options, comma-separated
-	shareSubnet    string // The subnet to which the volumes will be exported
-	serverHostname string // The hostname that should be returned as NFS Server
-	reclaimPolicy  v1.PersistentVolumeReclaimPolicy
-
-	persistentVolumeCapacity *prometheus.Desc
-	persistentVolumeUsed     *prometheus.Desc
+	logger *logrus.Entry
 }
 
-// Describe implements prometheus.Collector
-func (p ZFSProvisioner) Describe(ch chan<- *prometheus.Desc) {
-	ch <- p.persistentVolumeCapacity
-	ch <- p.persistentVolumeUsed
+// NewZFSProvisioner returns a ZFSProvisioner based on a given storageClass.
+func NewZFSProvisioner(logger *logrus.Entry, storageClass *storagev1.StorageClass) (*ZFSProvisioner, error) {
+	// Create a new logger if none is given and/or add the StorageClass name to
+	// its fields.
+	if logger == nil {
+		logger = logrus.NewEntry(logrus.New())
+	}
+	logger = logger.WithField("storageclass", storageClass.Name)
+
+	provisioner := ZFSProvisioner{
+		logger,
+	}
+	return &provisioner, nil
 }
 
-// Collect implements prometheus.Collector
-func (p ZFSProvisioner) Collect(ch chan<- prometheus.Metric) {
-	children, err := p.parent.Children(1)
+// Delete destroys a ZFS dataset representing a given PersistentVolume.
+func (p ZFSProvisioner) Delete(volume *corev1.PersistentVolume) error {
+	logger := p.logger.WithFields(logrus.Fields{
+		"pv":        volume.Name,
+		"namespace": volume.Namespace,
+		"dataset":   volume.Annotations[annDatasetPath],
+	})
+
+	// Retrieve volume for deletion
+	datasetPath := volume.Annotations[annDatasetPath]
+	dataset, err := zfs.GetDataset(datasetPath)
 	if err != nil {
-		log.WithFields(log.Fields{
-			"error": err,
-		}).Error("Collecting metrics failed")
+		logger.WithField("error", err.Error()).Error("Retrieving dataset for destruction failed")
+
+		return fmt.Errorf("Retrieving dataset for destruction failed: %s", err.Error())
 	}
 
-	for _, child := range children {
-		// Skip shapshots
-		if child.Type != "filesystem" {
-			continue
-		}
+	// Attempt to destroy dataset
+	if err := dataset.Destroy(zfs.DestroyRecursive); err != nil {
+		logger.WithField("error", err.Error()).Error("Destroying dataset failed")
 
-		capacity, used, err := p.datasetMetrics(child)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error": err,
-			}).Error("Collecting metrics failed")
-		} else {
-			ch <- *capacity
-			ch <- *used
-		}
+		return fmt.Errorf("Destroying dataset failed: %s", err.Error())
 	}
+
+	logger.Info("Destroyed PersistentVolume")
+	return nil
 }
 
-// NewZFSProvisioner returns a new ZFSProvisioner
-func NewZFSProvisioner(parent *zfs.Dataset, shareOptions string, shareSubnet string, serverHostname string, reclaimPolicy string) ZFSProvisioner {
-	// Prepend a comma if additional options are given
-	if shareOptions != "" {
-		shareOptions = "," + shareOptions
-	}
+// Provision creates a ZFS dataset representing a PersistentVolume from given
+// VolumeOptions.
+func (p ZFSProvisioner) Provision(options controller.VolumeOptions) (*corev1.PersistentVolume, error) {
+	logger := p.logger.WithFields(logrus.Fields{
+		"pvc":          options.PVC.Name,
+		"namespace":    options.PVC.Namespace,
+		"storageclass": options.PVC.Spec.StorageClassName,
+	})
 
-	var kubernetesReclaimPolicy v1.PersistentVolumeReclaimPolicy
-	// Parse reclaim policy
-	switch reclaimPolicy {
-	case "Delete":
-		kubernetesReclaimPolicy = v1.PersistentVolumeReclaimDelete
-	case "Retain":
-		kubernetesReclaimPolicy = v1.PersistentVolumeReclaimRetain
-	}
-
-	return ZFSProvisioner{
-		parent: parent,
-
-		shareOptions:   shareOptions,
-		shareSubnet:    shareSubnet,
-		serverHostname: serverHostname,
-		reclaimPolicy:  kubernetesReclaimPolicy,
-
-		persistentVolumeCapacity: prometheus.NewDesc(
-			"zfs_provisioner_persistent_volume_capacity",
-			"Capacity of a zfs persistent volume.",
-			[]string{"persistent_volume"},
-			prometheus.Labels{
-				"parent":   parent.Name,
-				"hostname": serverHostname,
+	// Prepare PersistentVolume to return later
+	annotations := make(map[string]string)
+	annotations[annCreatedBy] = createdBy
+	pv := corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        options.PVName,
+			Labels:      map[string]string{},
+			Annotations: annotations,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeReclaimPolicy: options.PersistentVolumeReclaimPolicy,
+			AccessModes:                   options.PVC.Spec.AccessModes,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceName(corev1.ResourceStorage): options.PVC.Spec.Resources.Requests[corev1.ResourceName(corev1.ResourceStorage)],
 			},
-		),
-		persistentVolumeUsed: prometheus.NewDesc(
-			"zfs_provisioner_persistent_volume_used",
-			"Usage of a zfs persistent volume.",
-			[]string{"persistent_volume"},
-			prometheus.Labels{
-				"parent":   parent.Name,
-				"hostname": serverHostname,
-			},
-		),
+			PersistentVolumeSource: corev1.PersistentVolumeSource{},
+		},
 	}
-}
 
-// datasetMetrics returns prometheus metrics for a given ZFS dataset
-func (p ZFSProvisioner) datasetMetrics(dataset *zfs.Dataset) (*prometheus.Metric, *prometheus.Metric, error) {
-	capacityString, err := dataset.GetProperty("refquota")
+	// Parse parameters and convert them to ZFSProvisionerParameters
+	var parameters ZFSProvisionerParameters
+	if err := mapstructure.Decode(options.Parameters, &parameters); err != nil {
+		logger.WithField("error", err).Error("Parsing StorageClass parameters failed")
+
+		return nil, fmt.Errorf("Parsing StorageClass parameters failed: %s", err.Error())
+	}
+
+	// Build new dataset name and properties
+	// TODO: Sanitize PVName
+	datasetPath := fmt.Sprintf("%s/%s", parameters.ParentDataset, options.PVName)
+	// Annotate dataset path for deletion
+	annotations[annDatasetPath] = datasetPath
+	datasetProperties := make(map[string]string)
+
+	// Convert storage limits and requests
+	resources := options.PVC.Spec.Resources
+	// A storage limit is represented by ZFS refquota
+	limitQuantity := resources.Limits["storage"]
+	limitQuantityP := &limitQuantity
+	limitBytes, ok := limitQuantityP.AsInt64()
+	if !ok {
+		logger.Error("Could not convert storage limit to bytes")
+
+		return nil, fmt.Errorf("Could not convert storage limit to bytes")
+	}
+	datasetProperties["refquota"] = string(limitBytes)
+	// A storage request is represented by ZFS refreservation
+	requestQuantity := resources.Requests["storage"]
+	requestQuantityP := &requestQuantity
+	requestBytes, ok := requestQuantityP.AsInt64()
+	if !ok {
+		logger.Error("Could not convert storage request to bytes")
+
+		return nil, fmt.Errorf("Could not convert storage request to bytes")
+	}
+	datasetProperties["refreservation"] = string(requestBytes)
+
+	// Set optional NFS share options
+	nfs := parameters.NFS
+	if nfs.Enabled {
+		datasetProperties["sharenfs"] = fmt.Sprintf("rw=@%s%s", nfs.ShareSubnet, nfs.AdditonalShareOptions)
+
+		pv.Spec.PersistentVolumeSource.NFS = &corev1.NFSVolumeSource{
+			Server:   nfs.ServerHostname,
+			Path:     datasetPath,
+			ReadOnly: false,
+		}
+	}
+
+	// Create dataset
+	dataset, err := zfs.CreateFilesystem(datasetPath, datasetProperties)
 	if err != nil {
-		return nil, nil, err
+		logger.WithField("error", err).Error("Creating ZFS dataset failed")
+
+		return nil, fmt.Errorf("Creating ZFS dataset failed: %s", err.Error())
 	}
-	capacityInt, _ := strconv.Atoi(capacityString)
 
-	usedString, err := dataset.GetProperty("usedbydataset")
-	if err != nil {
-		return nil, nil, err
-	}
-	usedInt, _ := strconv.Atoi(usedString)
-
-	capacity := prometheus.MustNewConstMetric(p.persistentVolumeCapacity, prometheus.GaugeValue, float64(capacityInt), dataset.Name)
-	used := prometheus.MustNewConstMetric(p.persistentVolumeUsed, prometheus.GaugeValue, float64(usedInt), dataset.Name)
-
-	return &capacity, &used, nil
+	logger.WithField("dataset", dataset.Name).Info("Created PersistentVolume")
+	return &pv, nil
 }
