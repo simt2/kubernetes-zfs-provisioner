@@ -4,11 +4,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/kubernetes-incubator/external-storage/lib/controller"
-	zfs "github.com/simt2/go-zfs"
+	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
+	zfs "github.com/mistifyio/go-zfs"
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/client-go/pkg/api/v1"
 )
 
 func TestDelete(t *testing.T) {
@@ -16,8 +16,8 @@ func TestDelete(t *testing.T) {
 	p := NewZFSProvisioner(parent, "", "127.0.0.1", "", "Retain")
 	options := controller.VolumeOptions{
 		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
-		PVName: "pv-testdelete",
-		PVC:    newClaim(resource.MustParse("1G"), []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany}, nil),
+		PVName:                        "pv-testdelete",
+		PVC:                           newClaim(resource.MustParse("1G"), []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany}, nil),
 	}
 	pv, _ := p.Provision(options)
 

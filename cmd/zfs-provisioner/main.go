@@ -5,14 +5,13 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
-	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/gentics/kubernetes-zfs-provisioner/pkg/provisioner"
-	"github.com/kubernetes-incubator/external-storage/lib/controller"
+	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
+	zfs "github.com/mistifyio/go-zfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/simt2/go-zfs"
 	"github.com/spf13/viper"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -25,7 +24,6 @@ const (
 	leasePeriod   = controller.DefaultLeaseDuration
 	retryPeriod   = controller.DefaultRetryPeriod
 	renewDeadline = controller.DefaultRenewDeadline
-	termLimit     = controller.DefaultTermLimit
 )
 
 func main() {
@@ -124,7 +122,8 @@ func main() {
 	log.Info("Started Prometheus exporter")
 
 	// Start the controller
-	pc := controller.NewProvisionController(clientset, 15*time.Second, viper.GetString("provisioner_name"), zfsProvisioner, serverVersion.GitVersion, false, 2, leasePeriod, renewDeadline, retryPeriod, termLimit)
+	pc := controller.NewProvisionController(clientset, "gentics.com/zfs", zfsProvisioner, serverVersion.GitVersion)
+	//pc := controller.NewProvisionController(clientset, 15*time.Second, viper.GetString("provisioner_name"), zfsProvisioner, serverVersion.GitVersion, false, 2, leasePeriod, renewDeadline, retryPeriod, termLimit)
 	log.Info("Listening for events")
 	pc.Run(wait.NeverStop)
 }

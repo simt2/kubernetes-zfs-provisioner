@@ -1,5 +1,10 @@
 SHELL := /usr/bin/env bash
 
+prepare:
+	sudo zfs create test/volumes	
+	sudo chown $$(whoami) $$(zfs get -Ho value mountpoint test/volumes)
+	sudo zfs allow $$(whoami) create,destroy,snapshot test/volumes
+
 test:
 	sudo zfs create test/volumes
 	sudo -E go test `go list ./... | grep -v vendor | grep pkg`

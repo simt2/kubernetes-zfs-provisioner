@@ -5,10 +5,10 @@ import (
 	"strconv"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/kubernetes-incubator/external-storage/lib/controller"
-	zfs "github.com/simt2/go-zfs"
+	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
+	zfs "github.com/mistifyio/go-zfs"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/pkg/api/v1"
 )
 
 // Provision creates a PersistentVolume, sets quota and shares it via NFS.
